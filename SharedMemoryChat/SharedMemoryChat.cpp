@@ -3,72 +3,85 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <vector>
+#include <cstring>
 
 using namespace std;
 
 // اسم الـ Shared Memory
 const wchar_t* SHM_NAME = L"Local\\ChatSharedMemory_OS_Project";
-// أسماء السيمفورز
-const wchar_t* SEM_A2B_NAME = L"Local\\Chat_Sem_A2B";
-const wchar_t* SEM_B2A_NAME = L"Local\\Chat_Sem_B2A";
+// اسم الـ Semaphore (نستخدمه كـ Mutex)
+const wchar_t* SEM_MUTEX_NAME = L"Local\\Chat_SharedMutex";
 
-// حجم الرسالة
+// حجم الرسالة والـ history
 const int MSG_SIZE = 256;
+const int MAX_MESSAGES = 1024;
 
-// البيانات اللي هتتبعت بين الـ Processes
-struct SharedData
+// كل رسالة في الشات
+struct ChatMessage
 {
-    char msgAtoB[MSG_SIZE]; // رسالة من A إلى B
-    char msgBtoA[MSG_SIZE]; // رسالة من B إلى A
+    char sender[32];       // اسم المرسل
+    char text[MSG_SIZE];   // محتوى الرسالة
 };
 
-void receiverThreadFunc(bool isUserA, SharedData* shared, HANDLE semFromOther)
+// البيانات المشتركة بين كل الـ Users
+struct SharedData
 {
-    while (true)
+    ChatMessage messages[MAX_MESSAGES];
+    int messageCount;
+};
+
+bool g_running = true;
+
+// Thread الاستقبال: يراقب الـ shared memory ويطبع أي رسائل جديدة من الآخرين
+void receiverThreadFunc(SharedData* shared, HANDLE hMutex, const string& myName)
+{
+    int lastSeen = 0;
+
+    while (g_running)
     {
-        // مستني رسالة من الطرف التاني
-        DWORD res = WaitForSingleObject(semFromOther, INFINITE);
+        vector<ChatMessage> newMessages;
+
+        // نقفل الـ mutex وننسخ الرسائل الجديدة محلياً
+        DWORD res = WaitForSingleObject(hMutex, INFINITE);
         if (res != WAIT_OBJECT_0)
             break;
 
-        string received;
-        if (isUserA)
+        int total = shared->messageCount;
+        for (int i = lastSeen; i < total; ++i)
         {
-            // A بيستقبل من B
-            received = string(shared->msgBtoA);
+            newMessages.push_back(shared->messages[i]);
         }
-        else
+        lastSeen = total;
+
+        ReleaseSemaphore(hMutex, 1, nullptr);
+
+        // نطبع الرسائل بعد ما نسيب الـ mutex
+        for (auto& msg : newMessages)
         {
-            // B بيستقبل من A
-            received = string(shared->msgAtoB);
+            // تجاهل رسائل نفسك (علشان ما تتكررّش)
+            if (strcmp(msg.sender, myName.c_str()) == 0)
+                continue;
+
+            cout << "\n[" << msg.sender << "]: " << msg.text << "\n> ";
+            cout.flush();
         }
 
-        if (received == "quit" || received == "QUIT")
-        {
-            cout << "\n[Other user disconnected]\n";
-            break;
-        }
-
-        cout << "\n[Other]: " << received << "\n> ";
-        cout.flush();
+        Sleep(100); // تهدئة بسيطة عشان مانبقاش busy-wait
     }
 }
 
 int main()
 {
-    cout << "=== Shared Memory Chat (OS Project) ===\n";
-    cout << "Choose your role:\n";
-    cout << "1) User A\n";
-    cout << "2) User B\n";
-    cout << "Enter choice: ";
+    cout << "=== Shared Memory Chat (Multi-User, OS Project) ===\n";
 
-    int choice;
-    cin >> choice;
-    cin.ignore(); // عشان نشيل الـ '\n' من الـ input
+    // ناخد Username من اليوزر
+    cout << "Enter your username: ";
+    string username;
+    getline(cin, username);
 
-    bool isUserA = (choice == 1);
-
-    cout << (isUserA ? "[You are User A]\n" : "[You are User B]\n");
+    if (username.empty())
+        username = "User";
 
     // 1) إنشاء أو فتح الـ Shared Memory
     HANDLE hMapFile = CreateFileMappingW(
@@ -86,6 +99,8 @@ int main()
         return 1;
     }
 
+    bool firstCreator = (GetLastError() != ERROR_ALREADY_EXISTS);
+
     SharedData* shared = (SharedData*)MapViewOfFile(
         hMapFile,
         FILE_MAP_ALL_ACCESS,
@@ -100,77 +115,101 @@ int main()
         return 1;
     }
 
-    // 2) إنشاء أو فتح السيمفورز
-    HANDLE hSemA2B = CreateSemaphoreW(
-        nullptr,
-        0,              // initial count (0 = مفيش رسالة لسه)
-        100,
-        SEM_A2B_NAME
-    );
-
-    HANDLE hSemB2A = CreateSemaphoreW(
-        nullptr,
-        0,
-        100,
-        SEM_B2A_NAME
-    );
-
-    if (!hSemA2B || !hSemB2A)
+    // لو أول واحد يخلق الـ shared memory نعمل تهيئة
+    if (firstCreator)
     {
-        cerr << "Failed to create/open semaphores. Error: " << GetLastError() << endl;
+        ZeroMemory(shared, sizeof(SharedData));
+        shared->messageCount = 0;
+    }
+
+    // 2) إنشاء أو فتح الـ Semaphore (Mutex)
+    HANDLE hMutex = CreateSemaphoreW(
+        nullptr,
+        1,               // initial count = 1 (مفتوح)
+        1,               // max count    = 1 (Mutex)
+        SEM_MUTEX_NAME
+    );
+
+    if (!hMutex)
+    {
+        cerr << "Failed to create/open semaphore. Error: " << GetLastError() << endl;
         if (shared) UnmapViewOfFile(shared);
         if (hMapFile) CloseHandle(hMapFile);
         return 1;
     }
 
-    // 3) تشغيل Thread الاستقبال
-    HANDLE semFromOther = isUserA ? hSemB2A : hSemA2B;
-    thread receiver(receiverThreadFunc, isUserA, shared, semFromOther);
-
+    cout << "\nWelcome, " << username << "!\n";
     cout << "Type messages and press Enter to send.\n";
     cout << "Type 'quit' to exit.\n\n";
 
-    string line;
+    // 3) نرسل رسالة "joined" كـ system message
+    {
+        string joinedMsg = username + " joined the chat.";
 
+        WaitForSingleObject(hMutex, INFINITE);
+
+        int idx = shared->messageCount % MAX_MESSAGES;
+        strncpy_s(shared->messages[idx].sender, username.c_str(), _TRUNCATE);
+        strncpy_s(shared->messages[idx].text, joinedMsg.c_str(), _TRUNCATE);
+        shared->messageCount++;
+
+        ReleaseSemaphore(hMutex, 1, nullptr);
+    }
+
+    // 4) تشغيل Thread الاستقبال
+    thread receiver(receiverThreadFunc, shared, hMutex, username);
+
+    string line;
     while (true)
     {
         cout << "> ";
         getline(cin, line);
 
-        if (isUserA)
-        {
-            // A بيبعت إلى B
-            memset(shared->msgAtoB, 0, MSG_SIZE);
-            strncpy_s(shared->msgAtoB, MSG_SIZE, line.c_str(), _TRUNCATE);
+        if (line.empty())
+            continue;
 
-            // نبلغ الـ B إن فيه رسالة
-            ReleaseSemaphore(hSemA2B, 1, nullptr);
-        }
-        else
-        {
-            // B بيبعت إلى A
-            memset(shared->msgBtoA, 0, MSG_SIZE);
-            strncpy_s(shared->msgBtoA, MSG_SIZE, line.c_str(), _TRUNCATE);
-
-            // نبلغ الـ A إن فيه رسالة
-            ReleaseSemaphore(hSemB2A, 1, nullptr);
-        }
-
+        // لو المستخدم عايز يخرج
         if (line == "quit" || line == "QUIT")
         {
+            g_running = false;
+
+            // نبعث رسالة system إنه خرج
+            string leftMsg = username + " left the chat.";
+
+            WaitForSingleObject(hMutex, INFINITE);
+
+            int idx = shared->messageCount % MAX_MESSAGES;
+            strncpy_s(shared->messages[idx].sender, username.c_str(), _TRUNCATE);
+            strncpy_s(shared->messages[idx].text, leftMsg.c_str(), _TRUNCATE);
+            shared->messageCount++;
+
+            ReleaseSemaphore(hMutex, 1, nullptr);
+
             cout << "Exiting chat...\n";
             break;
         }
+
+        // كتابة الرسالة في الـ shared memory
+        WaitForSingleObject(hMutex, INFINITE);
+
+        int idx = shared->messageCount % MAX_MESSAGES;
+        strncpy_s(shared->messages[idx].sender, username.c_str(), _TRUNCATE);
+        strncpy_s(shared->messages[idx].text, line.c_str(), _TRUNCATE);
+        shared->messageCount++;
+
+        ReleaseSemaphore(hMutex, 1, nullptr);
+
+        // نطبع الرسالة عندك مرة واحدة بس
+        cout << "You: " << line << "\n";
     }
 
-    // 4) Cleanup
+    // 5) Cleanup
     if (receiver.joinable())
         receiver.join();
 
     if (shared) UnmapViewOfFile(shared);
     if (hMapFile) CloseHandle(hMapFile);
-    if (hSemA2B) CloseHandle(hSemA2B);
-    if (hSemB2A) CloseHandle(hSemB2A);
+    if (hMutex) CloseHandle(hMutex);
 
     return 0;
 }
