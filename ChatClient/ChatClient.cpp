@@ -37,7 +37,23 @@ int main()
         return 0;
     }
 
-    // 2) Create socket
+    // 2) Get IP and Port from user input
+    string ipAddress;
+    string portStr;
+    cout << "Enter server IP (default: 127.0.0.1): ";
+    getline(cin, ipAddress);
+    if (ipAddress.empty()) {
+        ipAddress = "127.0.0.1";  // Default to localhost
+    }
+
+    cout << "Enter server port (default: 54000): ";
+    getline(cin, portStr);
+    if (portStr.empty()) {
+        portStr = "54000";  // Default port
+    }
+    int port = stoi(portStr);  // Convert port from string to int
+
+    // 3) Create socket
     SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock == INVALID_SOCKET) {
         cout << "Can't create socket!" << endl;
@@ -45,13 +61,13 @@ int main()
         return 0;
     }
 
-    // 3) Server info
+    // 4) Server info
     sockaddr_in server;
     server.sin_family = AF_INET;
-    server.sin_port = htons(54000);
-    inet_pton(AF_INET, "127.0.0.1", &server.sin_addr);
+    server.sin_port = htons(port);
+    inet_pton(AF_INET, ipAddress.c_str(), &server.sin_addr);
 
-    // 4) Connect
+    // 5) Connect
     int conn = connect(sock, (sockaddr*)&server, sizeof(server));
     if (conn == SOCKET_ERROR) {
         cout << "Can't connect to server!" << endl;
@@ -62,7 +78,7 @@ int main()
 
     cout << "Connected to server!\n";
 
-    // 5) ادخل اليوزر نيم وابعته كأول رسالة
+    // 6) Enter username and send as first message
     string username;
     cout << "Enter your username: ";
     getline(cin, username);
@@ -72,10 +88,10 @@ int main()
 
     send(sock, username.c_str(), (int)username.size(), 0);
 
-    // 6) Start receiver thread
+    // 7) Start receiver thread
     thread receiver(receiveMessages, sock);
 
-    // 7) Loop للإرسال
+    // 8) Loop to send messages
     string userInput;
 
     while (true)
@@ -97,7 +113,7 @@ int main()
         }
     }
 
-    // 8) Cleanup
+    // 9) Cleanup
     closesocket(sock);
     if (receiver.joinable())
         receiver.join();
